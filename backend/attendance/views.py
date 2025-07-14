@@ -1,4 +1,5 @@
-# attendance/views.py
+# attendance/views.py (UPDATED)
+# ================================
 from rest_framework import generics, status, permissions
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
@@ -7,11 +8,11 @@ from django.contrib.auth import authenticate
 from django.utils import timezone
 from django.db.models import Q
 from datetime import date, datetime, time
-from .models import User, AttendanceRecord, SecurityLog
+from .models import User, AttendanceRecord, SecurityLog, RoleShiftTiming
 from .serializers import (
     UserRegistrationSerializer, UserLoginSerializer, AttendanceMarkSerializer,
     AttendanceRecordSerializer, UserSerializer, UserDateUpdateSerializer,
-    SecurityLogSerializer
+    SecurityLogSerializer, AttendanceNotesUpdateSerializer, RoleShiftTimingSerializer
 )
 from .permissions import IsAdminUser, IsOwnerOrAdmin
 from .utils import get_client_ip, get_device_info, generate_attendance_csv, create_csv_response
@@ -43,6 +44,7 @@ def login_view(request):
         })
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+# UPDATED: mark_in_view with shift timing validation
 @api_view(['POST'])
 def mark_in_view(request):
     serializer = AttendanceMarkSerializer(data=request.data, context={'request': request})
@@ -60,6 +62,7 @@ def mark_in_view(request):
                 'check_in_longitude': serializer.validated_data['longitude'],
                 'check_in_ip': get_client_ip(request),
                 'check_in_device_info': str(get_device_info(request)),
+                'notes': serializer.validated_data.get('notes', ''),
             }
         )
         
@@ -86,13 +89,22 @@ def mark_in_view(request):
             record.check_in_longitude = serializer.validated_data['longitude']
             record.check_in_ip = get_client_ip(request)
             record.check_in_device_info = str(get_device_info(request))
+            record.notes = serializer.validated_data.get('notes', '')
             record.save()
         
-        return Response({
+        # Get shift timing and prepare response
+        response_data = {
             'message': 'Marked in successfully',
             'time': record.check_in_time,
-            'is_late': record.is_late
-        })
+            'is_late': record.is_late,
+            'notes_enabled': record.is_late,  # Enable notes only if late
+        }
+        
+        # Add expected start time if role has shift timing
+        if record.expected_start_time:
+            response_data['expected_start_time'] = record.expected_start_time
+        
+        return Response(response_data)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -148,6 +160,45 @@ def mark_out_view(request):
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+# NEW: Update attendance notes endpoint
+@api_view(['PATCH'])
+def update_attendance_notes(request, attendance_id):
+    try:
+        attendance = AttendanceRecord.objects.get(id=attendance_id)
+    except AttendanceRecord.DoesNotExist:
+        return Response(
+            {'error': 'Attendance record not found'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    
+    # Check permissions - user can only update their own attendance
+    if attendance.user != request.user:
+        return Response(
+            {'error': 'You can only update your own attendance notes'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+    
+    # Check if attendance is from today (optional restriction)
+    if attendance.date != date.today():
+        return Response(
+            {'error': 'You can only update notes for today\'s attendance'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    serializer = AttendanceNotesUpdateSerializer(
+        attendance, 
+        data=request.data, 
+        partial=True
+    )
+    if serializer.is_valid():
+        serializer.save()
+        return Response({
+            'message': 'Notes updated successfully',
+            'notes': serializer.validated_data['notes']
+        })
+    
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
 class MyAttendanceView(generics.ListAPIView):
     serializer_class = AttendanceRecordSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -191,6 +242,17 @@ class AdminAttendanceView(generics.ListAPIView):
             queryset = queryset.filter(is_late=True)
         
         return queryset.select_related('user')
+
+# NEW: Admin shift timing management
+class AdminShiftTimingListView(generics.ListCreateAPIView):
+    serializer_class = RoleShiftTimingSerializer
+    permission_classes = [IsAdminUser]
+    queryset = RoleShiftTiming.objects.all()
+
+class AdminShiftTimingDetailView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = RoleShiftTimingSerializer
+    permission_classes = [IsAdminUser]
+    queryset = RoleShiftTiming.objects.all()
 
 class AdminUserListView(generics.ListAPIView):
     serializer_class = UserSerializer
